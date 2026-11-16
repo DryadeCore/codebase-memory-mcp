@@ -1898,6 +1898,31 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
     return true;
 }
 
+/* `const Page = lazy(() => import('./Page'))` binds Page to the default export
+ * of ./Page, exactly as `import Page from './Page'` does: mounting <Page /> runs
+ * that component. Recorded as the same import binding (the `require` precedent
+ * above), so the mount resolves through it. */
+static bool process_js_lazy_import(CBMExtractCtx *ctx, TSNode call) {
+    TSNode parent = ts_node_parent(call);
+    if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "variable_declarator") != 0) {
+        return false;
+    }
+    TSNode path = cbm_js_lazy_import_path(parent, ctx->source);
+    if (ts_node_is_null(path)) {
+        return false;
+    }
+    TSNode name = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+    char *module = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, path, ctx->source));
+    if (!module || !module[0]) {
+        return false;
+    }
+    CBMImport imp = {.local_name = cbm_node_text(ctx->arena, name, ctx->source),
+                     .module_path = module,
+                     .is_default = true};
+    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+    return true;
+}
+
 static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx, CBM_SZ_512);
@@ -1930,7 +1955,7 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
         } else if (strcmp(kind, "call_expression") == 0) {
             /* CommonJS require() — only consume the node if we recognized
              * it as a require call; otherwise keep traversing the children. */
-            if (process_commonjs_require(ctx, node)) {
+            if (process_commonjs_require(ctx, node) || process_js_lazy_import(ctx, node)) {
                 push_children = false;
             }
         }

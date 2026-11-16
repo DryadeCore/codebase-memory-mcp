@@ -186,6 +186,29 @@ bool cbm_elixir_def_head_is(TSNode signature, TSNode node);
 // gap #3 (and #438 for the C-declarator case).
 TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 
+/* JS/TS: the inline function a declarator binds through a wrapper call that
+ * hands the function back as the value: `const X = useCallback(fn, deps)`,
+ * `forwardRef(fn)`, `memo(fn)`, `memo(forwardRef(fn))`, `useMemo(() => fn)`,
+ * and a higher-order component around an inline function bound to a
+ * PascalCase name. Null node otherwise. cbm_resolve_func_name_src names that
+ * function after the declarator, so it is a Function definition like
+ * `const X = fn` and the calls in its body have X as caller. */
+TSNode cbm_js_wrapped_callable(TSNode declarator, const char *source);
+/* The variable_declarator whose wrapped callable is `func` (see above), or a
+ * null node. */
+TSNode cbm_js_wrapping_declarator(TSNode func, const char *source);
+/* JS/TS: the path string node of a lazily loaded component binding,
+ * `const Page = lazy(() => import('./Page'))`, or a null node. The loader is
+ * an arrow whose whole body is one dynamic import, and the binding is a
+ * component name (PascalCase) or the call ends in `lazy`: React.lazy, a
+ * project wrapper around it, next/dynamic, loadable. Such a declarator binds
+ * the default export of the module, as `import Page from './Page'` does. A
+ * `.then(m => ({ default: m.Other }))` remap names a member this rule does
+ * not read, and is not matched. */
+TSNode cbm_js_lazy_import_path(TSNode declarator, const char *source);
+/* cbm_resolve_func_name with the source text, which the wrapper rule needs. */
+TSNode cbm_resolve_func_name_src(TSNode node, CBMLanguage lang, const char *source);
+
 // C++/CUDA out-of-line method definition (`void Foo::bar() {...}`): return the
 // immediate enclosing class name ("Foo") from the qualified declarator, or NULL
 // for a plain free function. Defined in extract_defs.c. Shared so the unified

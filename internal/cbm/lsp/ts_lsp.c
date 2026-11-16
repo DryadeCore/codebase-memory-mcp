@@ -278,6 +278,8 @@ static void ts_emit_resolved_call_reason_at(TSLSPContext *ctx, const char *calle
                                             const char *reason, TSNode site) {
     if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
+    if (ctx->module_level_jsx_only && !ctx->emitting_jsx)
+        return;
     CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = callee_qn;
@@ -301,7 +303,7 @@ static void ts_emit_resolved_reference_reason(TSLSPContext *ctx, const char *cal
                                               const char *strategy, float confidence,
                                               const char *reason, TSNode site) {
     if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn ||
-        ts_node_is_null(site)) {
+        ts_node_is_null(site) || ctx->module_level_jsx_only) {
         return;
     }
     CBMResolvedCall rc = {0};
@@ -324,6 +326,8 @@ static void ts_emit_resolved_reference(TSLSPContext *ctx, const char *callee_qn,
 static void ts_emit_unresolved_call_at(TSLSPContext *ctx, const char *expr_text, const char *reason,
                                        TSNode site) {
     if (!ctx || !ctx->resolved_calls || !ctx->enclosing_func_qn)
+        return;
+    if (ctx->module_level_jsx_only && !ctx->emitting_jsx)
         return;
     CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
@@ -2668,6 +2672,17 @@ static void bind_variable_declarator(TSLSPContext *ctx, TSNode decl) {
         char *nm = node_text(ctx, name);
         if (nm)
             cbm_scope_bind(ctx->current_scope, nm, bound);
+        /* `const save = () => {}` / `const save = useCallback(fn)`: the
+         * extractor makes this declarator a Function node with a module-level
+         * QN. Record that identity on the binding, so `onClick={save}` and
+         * `register(save)` can reference the node the value denotes. */
+        if (nm && ctx->module_qn && !ctx->enclosing_class_qn && !ts_node_is_null(value) &&
+            (node_kind_is(value, "arrow_function") || node_kind_is(value, "function_expression") ||
+             !ts_node_is_null(cbm_js_wrapped_callable(decl, ctx->source)))) {
+            const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, nm);
+            if (qn && cbm_registry_lookup_func(ctx->registry, qn))
+                (void)cbm_scope_update_callable(ctx->current_scope, nm, qn);
+        }
     } else if (node_kind_is(name, "object_pattern")) {
         // Destructure object: `const { a, b } = obj` — bind a and b to obj.a and obj.b types.
         uint32_t nc = ts_node_named_child_count(name);
@@ -2904,6 +2919,49 @@ void ts_process_statement(TSLSPContext *ctx, TSNode node) {
 
 // ── Call resolution + tree walk ───────────────────────────────────────────────
 
+/* A bare identifier used as a value where a callable is expected: a call
+ * argument (`register(save)`) or a JSX attribute (`onClick={save}`). */
+static void ts_resolve_identifier_value_reference(TSLSPContext *ctx, TSNode arg) {
+    if (!ctx || !ctx->enclosing_func_qn || !node_kind_is(arg, "identifier")) {
+        return;
+    }
+    char *name = node_text(ctx, arg);
+    if (ts_scope_has_binding(ctx->current_scope, name)) {
+        /* A binding that IS a function definition (bind_variable_declarator)
+         * denotes that definition's node; any other local stays a shadow. */
+        const char *callable = cbm_scope_lookup_callable(ctx->current_scope, name);
+        if (callable && ctx->cross_file_mode) {
+            ts_emit_resolved_reference_reason(ctx, callable, "lsp_callable_alias", 0.95f, name,
+                                              arg);
+        } else if (!callable) {
+            ts_block_shadowed_reference_usage(ctx, name, arg);
+        }
+        return;
+    }
+    /* Per-file resolution still performs the scope/shadow check above, but
+     * promotion waits for the project-wide registry phase where the graph
+     * target can be proved and materialized. */
+    if (!ctx->cross_file_mode) {
+        return;
+    }
+    const CBMRegisteredFunc *target = ts_exact_same_module_function(ctx, name);
+    const char *strategy = "lsp_ts_same_module_value_reference";
+    const char *reason = NULL;
+    if (!target) {
+        target = ts_exact_imported_function(ctx, name);
+        strategy = "lsp_ts_import_value_reference";
+        /* `import { foo as bar }`: the site names `bar`, the target is `foo`. */
+        if (target && ts_import_export_name(ctx, name) != name) {
+            strategy = "lsp_callable_value_reference";
+            reason = name;
+        }
+    }
+    if (target) {
+        ts_emit_resolved_reference_reason(ctx, target->qualified_name, strategy, 0.95f, reason,
+                                          arg);
+    }
+}
+
 static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
     if (!ctx || !ctx->enclosing_func_qn) {
         return;
@@ -2951,36 +3009,7 @@ static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
             }
             continue;
         }
-        if (!node_kind_is(arg, "identifier")) {
-            continue;
-        }
-        char *name = node_text(ctx, arg);
-        if (ts_scope_has_binding(ctx->current_scope, name)) {
-            ts_block_shadowed_reference_usage(ctx, name, arg);
-            continue;
-        }
-        /* Per-file resolution still performs the scope/shadow check above, but
-         * promotion waits for the project-wide registry phase where the graph
-         * target can be proved and materialized. */
-        if (!ctx->cross_file_mode) {
-            continue;
-        }
-        const CBMRegisteredFunc *target = ts_exact_same_module_function(ctx, name);
-        const char *strategy = "lsp_ts_same_module_value_reference";
-        const char *reason = NULL;
-        if (!target) {
-            target = ts_exact_imported_function(ctx, name);
-            strategy = "lsp_ts_import_value_reference";
-            /* `import { foo as bar }`: the site names `bar`, the target is `foo`. */
-            if (target && ts_import_export_name(ctx, name) != name) {
-                strategy = "lsp_callable_value_reference";
-                reason = name;
-            }
-        }
-        if (target) {
-            ts_emit_resolved_reference_reason(ctx, target->qualified_name, strategy, 0.95f, reason,
-                                              arg);
-        }
+        ts_resolve_identifier_value_reference(ctx, arg);
     }
 }
 
@@ -3360,9 +3389,18 @@ static const CBMType *narrow_discriminated_union(TSLSPContext *ctx, TSNode condi
 // Resolve a JSX element opening — emits a resolved call edge for component invocations.
 // `<Foo prop={x}/>` and `<Foo>...</Foo>` both invoke the component as a function.
 // Lowercase first letter is treated as a JSX intrinsic (HTML element) and ignored.
+static void resolve_jsx_element_rows(TSLSPContext *ctx, TSNode element_node);
+
 static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
     if (!ctx->jsx_mode)
         return;
+    bool saved = ctx->emitting_jsx;
+    ctx->emitting_jsx = true;
+    resolve_jsx_element_rows(ctx, element_node);
+    ctx->emitting_jsx = saved;
+}
+
+static void resolve_jsx_element_rows(TSLSPContext *ctx, TSNode element_node) {
     // The element's first named child is the opening element (or self-closing).
     const char *kind = ts_node_type(element_node);
     TSNode tag = element_node;
@@ -3387,7 +3425,15 @@ static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
      * symbols.  They may still be callable at runtime, but without a graph
      * node for that lexical value we must fail closed instead of redirecting
      * the tag to a same-named component definition. */
-    if (ts_scope_has_binding(ctx->current_scope, tag_name))
+    /* A module-level `const Row = memo(fn)` is bound in the root scope AND
+     * is the module's own Function definition (the wrapped callable): the
+     * binding and the graph node are one value, so the mount resolves. So
+     * does `const Page = lazy(() => import('./Page'))`, which the extractor
+     * records as an import binding. */
+    const CBMScope *owner = ts_scope_binding_owner(ctx->current_scope, tag_name);
+    if (owner && (owner->parent || !ctx->module_qn ||
+                  (!cbm_registry_lookup_symbol(ctx->registry, ctx->module_qn, tag_name) &&
+                   ts_import_first(ctx, tag_name) < 0)))
         return;
 
     // Resolve as a free-function/component call.
@@ -3552,6 +3598,14 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
     }
 
     // JSX element resolution (TSX / JSX modes).
+    if (ctx->jsx_mode && strcmp(kind, "jsx_attribute") == 0) {
+        /* `onClick={save}`: the attribute value is a callable value, as a
+         * call argument is. */
+        uint32_t ac = ts_node_named_child_count(node);
+        TSNode expr = ac > 0 ? ts_node_named_child(node, ac - 1) : node;
+        if (node_kind_is(expr, "jsx_expression") && ts_node_named_child_count(expr) == 1)
+            ts_resolve_identifier_value_reference(ctx, ts_node_named_child(expr, 0));
+    }
     if (ctx->jsx_mode &&
         (strcmp(kind, "jsx_element") == 0 || strcmp(kind, "jsx_self_closing_element") == 0)) {
         resolve_jsx_element(ctx, node);
@@ -3752,6 +3806,23 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
         // their enclosing_func_qn via process_function_body.
         CBMScope *saved = ctx->current_scope;
         ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        /* A nested function the extractor names (`const save = () => {}`,
+         * `const save = useCallback(fn)`, `function inner() {}`, an
+         * object-literal `key: () => {}`) is its own graph node there, with a
+         * module-level QN: the calls in its body carry that caller, so rows
+         * emitted under the outer function's QN could never join them. Class
+         * members keep their walk (the class owns their QN). */
+        const char *saved_func = ctx->enclosing_func_qn;
+        if (ctx->module_qn && !ctx->enclosing_class_qn && saved_func &&
+            strcmp(kind, "method_definition") != 0 && strcmp(kind, "method_signature") != 0) {
+            TSNode fname = cbm_resolve_func_name_src(node, CBM_LANG_TSX, ctx->source);
+            if (node_kind_is(fname, "identifier") || node_kind_is(fname, "property_identifier")) {
+                char *text = node_text(ctx, fname);
+                if (text && text[0])
+                    ctx->enclosing_func_qn =
+                        cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, text);
+            }
+        }
         TSNode params =
             ts_node_child_by_field_name(node, "parameters", TS_LSP_FIELD_LEN("parameters"));
         if (!ts_node_is_null(params)) {
@@ -3766,6 +3837,7 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             // process_node(body) so resolve_call_at fires for that expression.
             process_node(ctx, body);
         }
+        ctx->enclosing_func_qn = saved_func;
         ctx->current_scope = saved;
         return;
     }
@@ -3806,6 +3878,22 @@ static void process_node(TSLSPContext *ctx, TSNode node) {
             uint32_t nc = ts_node_named_child_count(body);
             for (uint32_t i = 0; i < nc; i++) {
                 TSNode m = ts_node_named_child(body, i);
+                if (node_kind_is(m, "public_field_definition")) {
+                    /* `render = () => <Row />`: a class-field arrow is a
+                     * method of the class (the extractor names it so). */
+                    TSNode fname =
+                        ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
+                    TSNode fval =
+                        ts_node_child_by_field_name(m, "value", TS_LSP_FIELD_LEN("value"));
+                    char *fn = node_kind_is(fval, "arrow_function") && !ts_node_is_null(fname)
+                                   ? node_text(ctx, fname)
+                                   : NULL;
+                    if (fn)
+                        process_function_body(
+                            ctx, fval, cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, fn),
+                            class_qn);
+                    continue;
+                }
                 if (!node_kind_is(m, "method_definition"))
                     continue;
                 TSNode mname = ts_node_child_by_field_name(m, "name", TS_LSP_FIELD_LEN("name"));
@@ -3906,6 +3994,22 @@ static void process_function_body(TSLSPContext *ctx, TSNode func_node, const cha
     ctx->current_scope = saved_scope;
 }
 
+/* A module-level statement that owns no function (`describe(...)`, a route
+ * table, `export default memo(...)`): its JSX mounts belong to the module,
+ * as the extractor attributes them. Only JSX rows are emitted; every other
+ * module-level call keeps its existing (registry) resolution. */
+static void process_module_level_jsx(TSLSPContext *ctx, TSNode node) {
+    if (!ctx->jsx_mode || !ctx->module_qn || ts_node_is_null(node))
+        return;
+    const char *saved_func = ctx->enclosing_func_qn;
+    bool saved_only = ctx->module_level_jsx_only;
+    ctx->enclosing_func_qn = ctx->module_qn;
+    ctx->module_level_jsx_only = true;
+    process_node(ctx, node);
+    ctx->module_level_jsx_only = saved_only;
+    ctx->enclosing_func_qn = saved_func;
+}
+
 static void process_top_level_variable_arrows(TSLSPContext *ctx, TSNode declaration) {
     if (!ctx || ts_node_is_null(declaration) || !ctx->module_qn)
         return;
@@ -3918,8 +4022,18 @@ static void process_top_level_variable_arrows(TSLSPContext *ctx, TSNode declarat
 
         TSNode name = ts_node_child_by_field_name(declarator, "name", TS_LSP_FIELD_LEN("name"));
         TSNode value = ts_node_child_by_field_name(declarator, "value", TS_LSP_FIELD_LEN("value"));
-        if (!node_kind_is(name, "identifier") || !node_kind_is(value, "arrow_function"))
+        if (!node_kind_is(name, "identifier") || ts_node_is_null(value))
             continue;
+        if (!node_kind_is(value, "arrow_function")) {
+            /* `const X = memo(fn)`: the wrapped function is X's body. Any
+             * other initializer owns no function: module-level JSX only. */
+            TSNode wrapped = cbm_js_wrapped_callable(declarator, ctx->source);
+            if (ts_node_is_null(wrapped)) {
+                process_module_level_jsx(ctx, value);
+                continue;
+            }
+            value = wrapped;
+        }
 
         char *function_name = node_text(ctx, name);
         if (!function_name)
@@ -3977,6 +4091,8 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
                 TSNode inner = ts_node_named_child(child, j);
                 if (node_kind_is(inner, "internal_module"))
                     process_node(ctx, inner);
+                else
+                    process_module_level_jsx(ctx, inner);
             }
         } else if (strcmp(kind, "export_statement") == 0) {
             // Walk the wrapped declaration.
@@ -4002,6 +4118,11 @@ void ts_lsp_process_file(TSLSPContext *ctx, TSNode root) {
                 } else if (strcmp(ik, "class_declaration") == 0 ||
                            strcmp(ik, "internal_module") == 0) {
                     process_node(ctx, inner);
+                } else if (strcmp(ik, "call_expression") == 0 ||
+                           strcmp(ik, "arrow_function") == 0 ||
+                           strcmp(ik, "function_expression") == 0) {
+                    /* `export default memo(...)` / an anonymous default. */
+                    process_module_level_jsx(ctx, inner);
                 }
             }
         }

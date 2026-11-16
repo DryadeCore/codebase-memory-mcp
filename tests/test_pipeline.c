@@ -15337,8 +15337,13 @@ static int assert_local_binding_shadow_contract(const char *dir, const char *db_
     int rc = 0;
     /* (1) the reported bug: locally bound names must not bind to the homonyms
      * in the never-imported file (RED before the fix, on both resolvers). */
-    if (cross_file_call_exists(s, project, "go", "submitForm")) {
+    if (count_calls_with(s, project, ".go", "Elsewhere.submitForm", NULL) != 0) {
         rc = 4;
+    }
+    /* ... and binds the caller's own definition: `const submitForm =
+     * useCallback(fn)` IS a function definition (the wrapped callable). */
+    if (rc == 0 && count_calls_with(s, project, ".go", "Caller.submitForm", NULL) != 1) {
+        rc = 10;
     }
     if (rc == 0 && cross_file_call_exists(s, project, "go", "setOpen")) {
         rc = 5;
@@ -22963,6 +22968,317 @@ TEST(python_or_default_keeps_operand_class) {
 
 TEST(python_or_default_keeps_operand_class_parallel) {
     return check_python_or_default_keeps_operand_class(true);
+}
+
+/* Number of nodes named `name` carrying `label`. */
+static int count_named_nodes(cbm_store_t *s, const char *project, const char *name,
+                             const char *label) {
+    cbm_node_t *nodes = NULL;
+    int n = 0;
+    int hits = 0;
+    cbm_store_find_nodes_by_name(s, project, name, &nodes, &n);
+    for (int i = 0; i < n; i++) {
+        hits += nodes[i].label && strcmp(nodes[i].label, label) == 0;
+    }
+    if (nodes) {
+        cbm_store_free_nodes(nodes, n);
+    }
+    return hits;
+}
+
+static const char *const tsx_leaf_file[2] = {"src/Leaf.tsx", "export function Leaf() {\n"
+                                                             "  return <span />;\n"
+                                                             "}\n"
+                                                             "export function save(v: string) {\n"
+                                                             "  return v;\n"
+                                                             "}\n"};
+
+/* `const X = useCallback(fn)`, `forwardRef(fn)`, `memo(function ...)`,
+ * `memo(forwardRef(fn))` and `useMemo(() => fn)` hand the inline function back
+ * as the value of X: X is that function. It had no Function node (a Variable),
+ * so the calls in its body were charged to the enclosing component, a mount of
+ * X had no CALLS target, and JSX inside `memo(function ...)` had no caller. A
+ * `useMemo(() => value)` stays a plain value. */
+static int check_tsx_wrapped_callable_is_a_function(bool parallel) {
+    const char *const files[][2] = {
+        {tsx_leaf_file[0], tsx_leaf_file[1]},
+        {"src/Wrapped.tsx",
+         "import { forwardRef, memo, useCallback, useMemo } from 'react';\n"
+         "import * as React from 'react';\n"
+         "import { Leaf, save } from './Leaf';\n"
+         "\n"
+         "export const Field = forwardRef<HTMLInputElement, { v: string }>((props, ref) => {\n"
+         "  return <input ref={ref} value={props.v} />;\n"
+         "});\n"
+         "\n"
+         "export const Panel = memo(function PanelImpl({ title }: { title: string }) {\n"
+         "  return <Leaf />;\n"
+         "});\n"
+         "\n"
+         "export const Both = React.memo(React.forwardRef((props: {}, ref) => <Leaf />));\n"
+         "\n"
+         "export function Page() {\n"
+         "  const handleSave = useCallback(async () => {\n"
+         "    save('x');\n"
+         "  }, []);\n"
+         "  const handlePoll = useCallback(() => {\n"
+         "    save('y');\n"
+         "  }, []);\n"
+         "  const makeKey = useMemo(() => (id: number) => save(String(id)), []);\n"
+         "  const total = useMemo(() => [1, 2].length, []);\n"
+         "  const start = () => {\n"
+         "    void handleSave();\n"
+         "    makeKey(total);\n"
+         "  };\n"
+         "  return (\n"
+         "    <div onClick={start}>\n"
+         "      <Field v=\"a\" />\n"
+         "      <Panel title=\"t\" />\n"
+         "      <Both />\n"
+         "      <button onClick={handlePoll} />\n"
+         "    </div>\n"
+         "  );\n"
+         "}\n"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 2, parallel);
+    int rc = r.s ? 0 : 1;
+    if (r.s) {
+        cbm_store_t *s = r.s;
+        const char *project = cbm_pipeline_project_name(r.p);
+        /* the wrapped callables are Function definitions under the binding's name */
+        if (count_named_nodes(s, project, "Field", "Function") != 1 ||
+            count_named_nodes(s, project, "Panel", "Function") != 1 ||
+            count_named_nodes(s, project, "Both", "Function") != 1 ||
+            count_named_nodes(s, project, "handleSave", "Function") != 1 ||
+            count_named_nodes(s, project, "makeKey", "Function") != 1) {
+            rc = 2;
+        }
+        /* the binding names the node; a memoised plain value is no function */
+        if (rc == 0 && (count_named_nodes(s, project, "PanelImpl", "Function") != 0 ||
+                        count_named_nodes(s, project, "total", "Function") != 0 ||
+                        count_named_nodes(s, project, "Panel", "Variable") != 0)) {
+            rc = 3;
+        }
+        /* mounting a wrapped component is a CALLS edge to it */
+        if (rc == 0 && (count_calls_with(s, project, ".Page", "Wrapped.Field", NULL) != 1 ||
+                        count_calls_with(s, project, ".Page", "Wrapped.Panel", NULL) != 1 ||
+                        count_calls_with(s, project, ".Page", "Wrapped.Both", NULL) != 1)) {
+            rc = 4;
+        }
+        /* JSX inside memo(function ...) and memo(forwardRef(...)) has a caller */
+        if (rc == 0 && (count_calls_with(s, project, "Wrapped.Panel", "Leaf.Leaf", NULL) != 1 ||
+                        count_calls_with(s, project, "Wrapped.Both", "Leaf.Leaf", NULL) != 1)) {
+            rc = 5;
+        }
+        /* the calls in a wrapped handler have the handler as caller ... */
+        if (rc == 0 && (count_calls_with(s, project, ".handleSave", "Leaf.save", NULL) != 1 ||
+                        count_calls_with(s, project, ".handlePoll", "Leaf.save", NULL) != 1 ||
+                        count_calls_with(s, project, ".makeKey", "Leaf.save", NULL) != 1 ||
+                        count_calls_with(s, project, ".Page", "Leaf.save", NULL) != 0)) {
+            rc = 6;
+        }
+        /* ... and calling the handler resolves to it */
+        if (rc == 0 && (count_calls_with(s, project, ".start", "Wrapped.handleSave", NULL) != 1 ||
+                        count_calls_with(s, project, ".start", "Wrapped.makeKey", NULL) != 1)) {
+            rc = 7;
+        }
+        /* a handler handed to a JSX attribute is a reference, never a call */
+        if (rc == 0 &&
+            (count_edges_with(s, project, "CALL_REFERENCE", ".Page", "Wrapped.handlePoll", NULL) !=
+                 1 ||
+             count_edges_with(s, project, "CALL_REFERENCE", ".Page", "Wrapped.start", NULL) != 1 ||
+             count_calls_with(s, project, ".Page", "Wrapped.handlePoll", NULL) != 0)) {
+            rc = 8;
+        }
+    }
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+TEST(tsx_wrapped_callable_is_a_function) {
+    return check_tsx_wrapped_callable_is_a_function(false);
+}
+
+TEST(tsx_wrapped_callable_is_a_function_parallel) {
+    return check_tsx_wrapped_callable_is_a_function(true);
+}
+
+/* A JSX mount is a call made by the nearest enclosing callable, whatever its
+ * shape: an arrow in an object literal, a class-field arrow, a nested arrow
+ * bound to a const, and a test callback (`it(...)`, which owns no function:
+ * the module is the caller). Only top-level functions and top-level arrow
+ * consts had their mounts resolved. */
+static int check_tsx_jsx_mount_from_any_enclosing_callable(bool parallel) {
+    const char *const files[][2] = {
+        {tsx_leaf_file[0], tsx_leaf_file[1]},
+        {"src/Table.tsx", "import { Leaf } from './Leaf';\n"
+                          "\n"
+                          "export const columns = [\n"
+                          "  {\n"
+                          "    id: 'a',\n"
+                          "    cell: () => <Leaf />,\n"
+                          "  },\n"
+                          "];\n"
+                          "\n"
+                          "export class Grid {\n"
+                          "  renderRow = () => <Leaf />;\n"
+                          "}\n"
+                          "\n"
+                          "export function List() {\n"
+                          "  const renderItem = () => <Leaf />;\n"
+                          "  return renderItem();\n"
+                          "}\n"},
+        {"src/Leaf.test.tsx", "import { render } from '@testing-library/react';\n"
+                              "import { Leaf } from './Leaf';\n"
+                              "\n"
+                              "describe('Leaf', () => {\n"
+                              "  it('renders', () => {\n"
+                              "    render(<Leaf />);\n"
+                              "  });\n"
+                              "});\n"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 3, parallel);
+    int in_object = -1, in_field = -1, in_nested = -1, in_test = -1, outer = -1;
+    if (r.s) {
+        const char *project = cbm_pipeline_project_name(r.p);
+        in_object = count_calls_with(r.s, project, "Table.cell", "Leaf.Leaf", "lsp_ts_jsx");
+        in_field = count_calls_with(r.s, project, "Grid.renderRow", "Leaf.Leaf", "lsp_ts_jsx");
+        in_nested = count_calls_with(r.s, project, "Table.renderItem", "Leaf.Leaf", "lsp_ts_jsx");
+        in_test = count_calls_with(r.s, project, "Leaf.test", "Leaf.Leaf", "lsp_ts_jsx");
+        outer = count_calls_with(r.s, project, "Table.List", "Leaf.Leaf", NULL);
+    }
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_EQ(in_object, 1);
+    ASSERT_EQ(in_field, 1);
+    ASSERT_EQ(in_nested, 1);
+    ASSERT_EQ(in_test, 1);
+    ASSERT_EQ(outer, 0); /* the nested arrow mounts it, not the outer function */
+    PASS();
+}
+
+TEST(tsx_jsx_mount_from_any_enclosing_callable) {
+    return check_tsx_jsx_mount_from_any_enclosing_callable(false);
+}
+
+TEST(tsx_jsx_mount_from_any_enclosing_callable_parallel) {
+    return check_tsx_jsx_mount_from_any_enclosing_callable(true);
+}
+
+/* `const Page = lazy(() => import('./Page'))` binds the default export of
+ * ./Page, through React.lazy or a project wrapper around it: mounting <Page />
+ * runs that component. The binding was a Variable that shadowed the mount. A
+ * `.then(...)` remap picks a member the rule does not read: no edge. */
+static int check_tsx_lazy_component_binds_default_export(bool parallel) {
+    const char *const files[][2] = {
+        {tsx_leaf_file[0], tsx_leaf_file[1]},
+        {"src/Settings.tsx", "export default function Settings() {\n"
+                             "  return <div />;\n"
+                             "}\n"},
+        {"src/Report.tsx", "export default function Report() {\n"
+                           "  return <div />;\n"
+                           "}\n"},
+        {"src/Routes.tsx",
+         "import { lazy } from 'react';\n"
+         "import { lazyRetry } from './retry';\n"
+         "\n"
+         "const Settings = lazy(() => import('./Settings'));\n"
+         "const Report = lazyRetry(() => import('./Report'));\n"
+         "const Named = lazy(() => import('./Leaf').then((m) => ({ default: m.Leaf })));\n"
+         "\n"
+         "export function AppRoutes() {\n"
+         "  return (\n"
+         "    <main>\n"
+         "      <Settings />\n"
+         "      <Report />\n"
+         "      <Named />\n"
+         "    </main>\n"
+         "  );\n"
+         "}\n"},
+        {"src/retry.ts", "export function lazyRetry<T>(load: () => Promise<T>) {\n"
+                         "  return load;\n"
+                         "}\n"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 5, parallel);
+    int plain = -1, wrapped = -1, remapped = -1, shadow = -1;
+    if (r.s) {
+        const char *project = cbm_pipeline_project_name(r.p);
+        plain = count_calls_with(r.s, project, ".AppRoutes", "Settings.Settings", NULL);
+        wrapped = count_calls_with(r.s, project, ".AppRoutes", "Report.Report", NULL);
+        remapped = count_calls_with(r.s, project, ".AppRoutes", "Leaf.Leaf", NULL);
+        shadow = count_named_nodes(r.s, project, "Settings", "Variable") +
+                 count_named_nodes(r.s, project, "Report", "Variable");
+    }
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_EQ(plain, 1);
+    ASSERT_EQ(wrapped, 1);
+    ASSERT_EQ(remapped, 0);
+    ASSERT_EQ(shadow, 0); /* an import binding, not a Variable definition */
+    PASS();
+}
+
+TEST(tsx_lazy_component_binds_default_export) {
+    return check_tsx_lazy_component_binds_default_export(false);
+}
+
+TEST(tsx_lazy_component_binds_default_export_parallel) {
+    return check_tsx_lazy_component_binds_default_export(true);
+}
+
+/* `function Row({ onClose })`: a destructured parameter is a local of the
+ * function. Calling it must not bind, by name alone, an unrelated `onClose`
+ * in a file the caller never imports (the plain-parameter rule of #1355). */
+static int check_tsx_destructured_param_is_a_local_binding(bool parallel) {
+    const char *const files[][2] = {
+        {"src/Elsewhere.tsx", "export function onClose() {\n"
+                              "  return 0;\n"
+                              "}\n"
+                              "export function onOpen() {\n"
+                              "  return 1;\n"
+                              "}\n"},
+        {"src/Row.tsx", "export function Row({ onClose, label = 'x' }: { onClose: () => void; "
+                        "label?: string }) {\n"
+                        "  const done = () => {\n"
+                        "    onClose();\n"
+                        "  };\n"
+                        "  return <button onClick={done}>{label}</button>;\n"
+                        "}\n"
+                        "\n"
+                        "export function Unbound() {\n"
+                        "  return onOpen();\n"
+                        "}\n"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 2, parallel);
+    int homonym = -1, unbound = -1;
+    if (r.s) {
+        const char *project = cbm_pipeline_project_name(r.p);
+        homonym = count_calls_with(r.s, project, ".done", "Elsewhere.onClose", NULL);
+        unbound = count_calls_with(r.s, project, ".Unbound", "Elsewhere.onOpen", NULL);
+    }
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_EQ(homonym, 0);
+    ASSERT_EQ(unbound, 1); /* control: a name the caller never binds keeps its edge */
+    PASS();
+}
+
+TEST(tsx_destructured_param_is_a_local_binding) {
+    return check_tsx_destructured_param_is_a_local_binding(false);
+}
+
+TEST(tsx_destructured_param_is_a_local_binding_parallel) {
+    return check_tsx_destructured_param_is_a_local_binding(true);
 }
 
 TEST(python_dotted_base_inheritance) {
@@ -36103,6 +36419,14 @@ SUITE(pipeline) {
     RUN_TEST(python_return_annotation_types_receiver_parallel);
     RUN_TEST(python_or_default_keeps_operand_class);
     RUN_TEST(python_or_default_keeps_operand_class_parallel);
+    RUN_TEST(tsx_wrapped_callable_is_a_function);
+    RUN_TEST(tsx_wrapped_callable_is_a_function_parallel);
+    RUN_TEST(tsx_jsx_mount_from_any_enclosing_callable);
+    RUN_TEST(tsx_jsx_mount_from_any_enclosing_callable_parallel);
+    RUN_TEST(tsx_lazy_component_binds_default_export);
+    RUN_TEST(tsx_lazy_component_binds_default_export_parallel);
+    RUN_TEST(tsx_destructured_param_is_a_local_binding);
+    RUN_TEST(tsx_destructured_param_is_a_local_binding_parallel);
     RUN_TEST(python_dotted_base_inheritance);
     RUN_TEST(python_dotted_base_inheritance_parallel);
     RUN_TEST(pipeline_python_package_reexports_resolve_by_lsp);

@@ -767,6 +767,200 @@ static TSNode resolve_func_name_c_family(TSNode *node_ptr, CBMLanguage lang, con
 
 // Resolve the name node for a function, handling language-specific quirks.
 // Uses a loop to handle template_declaration unwrapping (avoids recursion).
+static bool js_node_text_is(TSNode node, const char *source, const char *want);
+
+static bool js_node_is_inline_function(TSNode node) {
+    if (ts_node_is_null(node)) {
+        return false;
+    }
+    const char *kind = ts_node_type(node);
+    return strcmp(kind, "arrow_function") == 0 || strcmp(kind, "function_expression") == 0 ||
+           strcmp(kind, "function") == 0;
+}
+
+/* The wrappers that return their callback as the value, by the name the call
+ * ends in (`memo` and `React.memo` are one wrapper: the spelling of the
+ * receiver decides nothing). A hook named use...Callback follows the
+ * useCallback contract by convention. */
+static bool js_callee_returns_its_callback(TSNode callee, const char *source) {
+    if (strcmp(ts_node_type(callee), "member_expression") == 0) {
+        callee = ts_node_child_by_field_name(callee, TS_FIELD("property"));
+    }
+    if (ts_node_is_null(callee)) {
+        return false;
+    }
+    static const char *const names[] = {"forwardRef", "memo",           "observer",
+                                        "useEvent",   "useEffectEvent", NULL};
+    for (int i = 0; names[i]; i++) {
+        if (js_node_text_is(callee, source, names[i])) {
+            return true;
+        }
+    }
+    const char *text = source + ts_node_start_byte(callee);
+    size_t len = ts_node_end_byte(callee) - ts_node_start_byte(callee);
+    static const char suffix[] = "Callback";
+    size_t slen = sizeof(suffix) - 1;
+    return len >= 3 + slen && memcmp(text, "use", 3) == 0 &&
+           memcmp(text + len - slen, suffix, slen) == 0;
+}
+
+static bool js_arrow_starts_dynamic_import(TSNode func, const char *source) {
+    if (ts_node_is_null(func) || strcmp(ts_node_type(func), "arrow_function") != 0) {
+        return false;
+    }
+    TSNode body = ts_node_child_by_field_name(func, TS_FIELD("body"));
+    return !ts_node_is_null(body) && ts_node_end_byte(body) - ts_node_start_byte(body) > 6 &&
+           memcmp(source + ts_node_start_byte(body), "import(", 7) == 0;
+}
+
+static TSNode js_call_wrapped_callable(TSNode call, const char *source, bool component, int depth) {
+    TSNode none = {0};
+    if (depth > 3 || ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
+        return none;
+    }
+    TSNode callee = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(callee) || ts_node_is_null(args) ||
+        strcmp(ts_node_type(args), "arguments") != 0 || ts_node_named_child_count(args) == 0) {
+        return none;
+    }
+    TSNode first = ts_node_named_child(args, 0);
+    TSNode leaf = strcmp(ts_node_type(callee), "member_expression") == 0
+                      ? ts_node_child_by_field_name(callee, TS_FIELD("property"))
+                      : callee;
+    if (ts_node_is_null(leaf)) {
+        return none;
+    }
+    /* `useMemo(() => fn, deps)`: the memoised VALUE is the function the
+     * callback returns, never the callback itself. */
+    if (js_node_text_is(leaf, source, "useMemo")) {
+        if (strcmp(ts_node_type(first), "arrow_function") != 0) {
+            return none;
+        }
+        TSNode body = ts_node_child_by_field_name(first, TS_FIELD("body"));
+        return js_node_is_inline_function(body) ? body : none;
+    }
+    /* A loader, `lazy(() => import('./X'))` in any spelling, binds what the
+     * module exports: an import binding, never a definition. */
+    if (js_node_text_is(leaf, source, "lazy") || js_arrow_starts_dynamic_import(first, source)) {
+        return none;
+    }
+    /* A component binding (PascalCase) around an inline function is a
+     * higher-order component: `const Row = styled(function (props) {...})`. */
+    if (!js_callee_returns_its_callback(callee, source) && !component) {
+        return none;
+    }
+    if (js_node_is_inline_function(first)) {
+        return first;
+    }
+    return js_call_wrapped_callable(first, source, component, depth + 1);
+}
+
+TSNode cbm_js_wrapped_callable(TSNode declarator, const char *source) {
+    TSNode none = {0};
+    if (!source || ts_node_is_null(declarator) ||
+        strcmp(ts_node_type(declarator), "variable_declarator") != 0) {
+        return none;
+    }
+    TSNode name = ts_node_child_by_field_name(declarator, TS_FIELD("name"));
+    TSNode value = ts_node_child_by_field_name(declarator, TS_FIELD("value"));
+    if (ts_node_is_null(name) || ts_node_is_null(value) ||
+        strcmp(ts_node_type(name), "identifier") != 0) {
+        return none;
+    }
+    for (int hops = 0; hops < 4 && !ts_node_is_null(value); hops++) {
+        const char *kind = ts_node_type(value);
+        if (strcmp(kind, "parenthesized_expression") != 0 && strcmp(kind, "as_expression") != 0 &&
+            strcmp(kind, "satisfies_expression") != 0 && strcmp(kind, "non_null_expression") != 0) {
+            break;
+        }
+        value = ts_node_named_child(value, 0);
+    }
+    char first = source[ts_node_start_byte(name)];
+    return js_call_wrapped_callable(value, source, first >= 'A' && first <= 'Z', 0);
+}
+
+TSNode cbm_js_wrapping_declarator(TSNode func, const char *source) {
+    TSNode none = {0};
+    if (!source || !js_node_is_inline_function(func)) {
+        return none;
+    }
+    TSNode cur = ts_node_parent(func);
+    for (int hops = 0; hops < 12 && !ts_node_is_null(cur); hops++) {
+        const char *kind = ts_node_type(cur);
+        if (strcmp(kind, "variable_declarator") == 0) {
+            return ts_node_eq(cbm_js_wrapped_callable(cur, source), func) ? cur : none;
+        }
+        if (strcmp(kind, "arguments") != 0 && strcmp(kind, "call_expression") != 0 &&
+            strcmp(kind, "arrow_function") != 0 && strcmp(kind, "parenthesized_expression") != 0 &&
+            strcmp(kind, "as_expression") != 0 && strcmp(kind, "satisfies_expression") != 0 &&
+            strcmp(kind, "non_null_expression") != 0) {
+            return none;
+        }
+        cur = ts_node_parent(cur);
+    }
+    return none;
+}
+
+TSNode cbm_js_lazy_import_path(TSNode declarator, const char *source) {
+    TSNode none = {0};
+    if (!source || ts_node_is_null(declarator) ||
+        strcmp(ts_node_type(declarator), "variable_declarator") != 0) {
+        return none;
+    }
+    TSNode name = ts_node_child_by_field_name(declarator, TS_FIELD("name"));
+    TSNode call = ts_node_child_by_field_name(declarator, TS_FIELD("value"));
+    if (ts_node_is_null(name) || strcmp(ts_node_type(name), "identifier") != 0 ||
+        ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
+        return none;
+    }
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "member_expression") == 0) {
+        fn = ts_node_child_by_field_name(fn, TS_FIELD("property"));
+    }
+    char first = source[ts_node_start_byte(name)];
+    bool component = first >= 'A' && first <= 'Z';
+    if (ts_node_is_null(fn) || (!component && !js_node_text_is(fn, source, "lazy")) ||
+        ts_node_is_null(args) || strcmp(ts_node_type(args), "arguments") != 0 ||
+        ts_node_named_child_count(args) == 0) {
+        return none;
+    }
+    TSNode loader = ts_node_named_child(args, 0);
+    if (strcmp(ts_node_type(loader), "arrow_function") != 0) {
+        return none;
+    }
+    TSNode body = ts_node_child_by_field_name(loader, TS_FIELD("body"));
+    if (ts_node_is_null(body) || strcmp(ts_node_type(body), "call_expression") != 0) {
+        return none;
+    }
+    TSNode import_kw = ts_node_child_by_field_name(body, TS_FIELD("function"));
+    TSNode import_args = ts_node_child_by_field_name(body, TS_FIELD("arguments"));
+    if (ts_node_is_null(import_kw) || strcmp(ts_node_type(import_kw), "import") != 0 ||
+        ts_node_is_null(import_args) || ts_node_named_child_count(import_args) == 0) {
+        return none;
+    }
+    TSNode path = ts_node_named_child(import_args, 0);
+    return strcmp(ts_node_type(path), "string") == 0 ? path : none;
+}
+
+static bool js_family_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+           lang == CBM_LANG_ARKTS;
+}
+
+TSNode cbm_resolve_func_name_src(TSNode node, CBMLanguage lang, const char *source) {
+    if (source && js_family_lang(lang)) {
+        /* The binding names the wrapped function, over a function
+         * expression's own name: callers mount and call the binding. */
+        TSNode declarator = cbm_js_wrapping_declarator(node, source);
+        if (!ts_node_is_null(declarator)) {
+            return ts_node_child_by_field_name(declarator, TS_FIELD("name"));
+        }
+    }
+    return cbm_resolve_func_name(node, lang);
+}
+
 TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
     enum { MAX_TEMPLATE_DEPTH = 2 };
     for (int tmpl_depth = 0; tmpl_depth < MAX_TEMPLATE_DEPTH; tmpl_depth++) {
@@ -6983,7 +7177,7 @@ static void push_make_rule_targets(CBMExtractCtx *ctx, TSNode node, const CBMDef
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
-    TSNode name_node = cbm_resolve_func_name(node, ctx->language);
+    TSNode name_node = cbm_resolve_func_name_src(node, ctx->language, ctx->source);
     if (ctx->language == CBM_LANG_C && ctx->test_declarations &&
         ctx->test_declarations_raw_source) {
         TSNode candidate_name, candidate_body;
@@ -7303,7 +7497,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // JS/TS export detection
     if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
         ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
-        if (is_js_exported(node)) {
+        TSNode wrapping = cbm_js_wrapping_declarator(node, ctx->source);
+        if (is_js_exported(ts_node_is_null(wrapping) ? node : wrapping)) {
             def.is_entry_point = true;
         }
     }
@@ -10984,7 +11179,15 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                 strcmp(vk, "generator_function") == 0) {
                 continue;
             }
-            is_require = is_require_import_call(value, ctx->source, a);
+            /* `const X = useCallback(fn)` and the like: the wrapped function
+             * is the definition of X (cbm_js_wrapped_callable). */
+            if (!ts_node_is_null(cbm_js_wrapped_callable(child, ctx->source))) {
+                continue;
+            }
+            /* `const Page = lazy(() => import('./Page'))` is an import
+             * binding too (extract_imports records it). */
+            is_require = is_require_import_call(value, ctx->source, a) ||
+                         !ts_node_is_null(cbm_js_lazy_import_path(child, ctx->source));
         }
         TSNode vname = ts_node_child_by_field_name(child, TS_FIELD("name"));
         if (!ts_node_is_null(vname)) {

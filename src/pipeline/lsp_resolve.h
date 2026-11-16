@@ -496,10 +496,19 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
         if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
             continue;
         }
-        if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
-            continue;
-        }
         int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
+        if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
+            /* A JSX mount is a synthetic call keyed by its tag's byte range,
+             * unique in the file: the same occurrence is the same mount
+             * whatever name the two walks gave its enclosing callable (a
+             * class-field arrow, a callback argument). The edge is sourced
+             * from the extractor's enclosing callable either way. */
+            bool jsx_row = rc->strategy && (strncmp(rc->strategy, "lsp_ts_jsx", 10) == 0 ||
+                                            strcmp(rc->strategy, "lsp_import_alias") == 0);
+            if (!(call->requires_lsp_resolution && jsx_row && site_rank == 2)) {
+                continue;
+            }
+        }
         if (site_rank == 0 || !cbm_pipeline_invocation_leaf_matches(rc, call, site_rank)) {
             continue;
         }

@@ -67,6 +67,10 @@ typedef struct {
     bool jsx_mode;
     bool dts_mode;
     bool cross_file_mode; // project-wide registry is available for exact reference proof
+    /* Module-level statements own no function, so only their JSX mounts are
+     * emitted (attributed to the module); emitting_jsx marks such a row. */
+    bool module_level_jsx_only;
+    bool emitting_jsx;
     bool strict; // tsconfig "strict": true → fewer implicit-any fallbacks
     bool debug;  // CBM_LSP_DEBUG env
 

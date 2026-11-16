@@ -10026,8 +10026,8 @@ TEST(extract_tsx_bare_call_flags_locally_bound_callee) {
         bool expect_bound;
         int seen;
     } cases[] = {
-        {"submitForm", true, 0},   /* const x = useCallback(...): the reported shape    */
-        {"lateBound", true, 0},    /* same, declared after the caller (const TDZ scope) */
+        {"submitForm", false, 0},  /* const x = useCallback(fn): a real definition      */
+        {"lateBound", false, 0},   /* same, declared after the caller                   */
         {"setOpen", true, 0},      /* array-pattern element                             */
         {"onParam", true, 0},      /* parameter                                         */
         {"typedLocal", true, 0},   /* call result behind a type assertion               */

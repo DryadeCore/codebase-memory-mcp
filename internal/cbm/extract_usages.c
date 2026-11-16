@@ -1698,6 +1698,16 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
                    ? node
                    : (TSNode){0};
     }
+    /* `onClick={save}`: a handler handed to a JSX attribute is a callable
+     * value occurrence exactly like `register(save)`; the TS resolver emits
+     * its row at the same identifier. */
+    if (ts_family && strcmp(kind, "identifier") == 0 && !ts_node_is_null(parent) &&
+        strcmp(ts_node_type(parent), "jsx_expression") == 0) {
+        TSNode attribute = ts_node_parent(parent);
+        return !ts_node_is_null(attribute) && strcmp(ts_node_type(attribute), "jsx_attribute") == 0
+                   ? node
+                   : (TSNode){0};
+    }
     if (ctx->language == CBM_LANG_PYTHON && strcmp(kind, "identifier") == 0 &&
         !ts_node_is_null(parent) && strcmp(ts_node_type(parent), "attribute") == 0) {
         TSNode attribute = ts_node_child_by_field_name(parent, TS_FIELD("attribute"));
@@ -2152,7 +2162,7 @@ static bool js_value_declares_callable(TSNode value) {
 
 /* True when a JS/TS binding names no definition of the project: a parameter,
  * a declarator whose initializer is not a function or class
- * (`const save = useCallback(...)`), or an array-pattern element
+ * (`const rows = useRows(...)`), or an array-pattern element
  * (`const [open, setOpen] = useState()`). The declaration chose the name, so a
  * project function that merely shares it is unrelated.
  *
@@ -2162,7 +2172,7 @@ static bool js_value_declares_callable(TSNode value) {
  * object-pattern name (`const { removeItem } = useStore()`, a destructured
  * prop) is no binding occurrence for this walk at all, so it is never flagged
  * either; in a declarator that name is a member some definition does declare. */
-static bool js_binding_names_no_definition(TSNode node, bool parameter) {
+static bool js_binding_names_no_definition(TSNode node, bool parameter, const char *source) {
     if (parameter) {
         return true;
     }
@@ -2180,7 +2190,8 @@ static bool js_binding_names_no_definition(TSNode node, bool parameter) {
     TSNode name = ts_node_child_by_field_name(parent, TS_FIELD("name"));
     TSNode value = ts_node_child_by_field_name(parent, TS_FIELD("value"));
     return !ts_node_is_null(name) && ts_node_eq(name, node) && !ts_node_is_null(value) &&
-           !js_value_declares_callable(value);
+           !js_value_declares_callable(value) &&
+           ts_node_is_null(cbm_js_wrapped_callable(parent, source));
 }
 
 static bool import_kind_matches(TSNode node, const CBMLangSpec *spec) {
@@ -2507,7 +2518,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
     binding->name = name;
     binding->names_no_definition = !import_binding && ts_node_is_null(function_declaration) &&
                                    js_family_language(ctx->language) &&
-                                   js_binding_names_no_definition(node, parameter);
+                                   js_binding_names_no_definition(node, parameter, ctx->source);
 }
 
 static int compare_lexical_bindings(const void *left_ptr, const void *right_ptr) {
@@ -2893,6 +2904,21 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         return;
     }
     if (inside_direct_perl_coderef(ctx, node)) {
+        return;
+    }
+    /* JS/TS `function Row({ onClose })`: a destructured parameter is a local
+     * of the function, like any parameter, though its shorthand pattern node
+     * is no identifier. A destructured declarator (`const { remove } =
+     * useStore()`) stays unrecorded: that name is a member some definition
+     * declares. */
+    if (js_family_language(ctx->language) &&
+        strcmp(ts_node_type(node), "shorthand_property_identifier_pattern") == 0) {
+        if (binding_is_parameter(ctx, node, spec)) {
+            char *param_name = cbm_node_text(ctx->arena, node, ctx->source);
+            if (param_name && param_name[0]) {
+                record_lexical_binding(ctx, state, node, spec, param_name, false);
+            }
+        }
         return;
     }
     bool reference_node = is_reference_node(node, ctx->language);

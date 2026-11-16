@@ -1263,7 +1263,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * SCSS mixin, SQL create_function, Julia short-form, etc., so
      * push_boundary_scopes never pushed a SCOPE_FUNC and the calls inside were
      * mis-attributed to the enclosing Module (QUALITY_ANALYSIS gap #3). */
-    TSNode name_node = cbm_resolve_func_name(node, ctx->language);
+    TSNode name_node = cbm_resolve_func_name_src(node, ctx->language, ctx->source);
     if (ts_node_is_null(name_node)) {
         return NULL;
     }
