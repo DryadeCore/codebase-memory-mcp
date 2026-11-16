@@ -27,6 +27,7 @@ static const double PC_SWIFT_AMBIGUOUS_CONF = 0.55;
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h" /* cbm_pxc_def_import_callee */
 #include "pipeline/laravel_routing.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
@@ -1239,7 +1240,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
     bool rust_external = lsp && cbm_pipeline_rust_external_target(
                                     lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
     cbm_resolution_t res = {0};
-    if (swift_candidates >= 0) {
+    /* A def's own import names the callee (MUST match pass_parallel.c). */
+    const cbm_gbuf_node_t *def_import = cbm_pxc_def_import_callee(
+        ctx->gbuf, ctx->project_name, rel, lang, result, call);
+    if (def_import) {
+        res = (cbm_resolution_t){def_import->qualified_name, "import_map", 0.95, 1};
+    } else if (swift_candidates >= 0) {
         res = calls_registry_resolution(ctx, call, module_qn, imp_keys, imp_vals, imp_count, lang,
                                         rust_external, php_vendor_call, java_external,
                                         cbm_pipeline_caller_is_test(source_node, rel, lang));

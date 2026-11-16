@@ -3466,6 +3466,15 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                           module_qn, imp_vals, imp_count,
                                                           candidates, CBM_SZ_256);
         }
+        /* A def's own import names the callee (MUST match pass_calls.c). */
+        const cbm_gbuf_node_t *def_import =
+            (!res.qualified_name || !res.qualified_name[0])
+                ? cbm_pxc_def_import_callee(rc->main_gbuf, rc->project_name, rel, lang, result,
+                                            call)
+                : NULL;
+        if (def_import) {
+            res = (cbm_resolution_t){def_import->qualified_name, "import_map", 0.95, 1};
+        }
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
             !rust_external && !php_vendor_call && !java_external && count == 0) {
             /* Python LEGB fallback first (MUST match pass_calls.c). */

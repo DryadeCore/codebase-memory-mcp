@@ -1966,6 +1966,46 @@ static const CBMType *py_substitute_self(PyLSPContext *ctx, const CBMType *t,
     return t;
 }
 
+/* A return annotation is registered before any scope exists, as the bare
+ * class name qualified with the consumer's module (own file) or not at all
+ * (cross-file def). `def make() -> Store` with `Store` imported, or defined
+ * beside a `make` that another file imports, therefore names a type the
+ * registry does not hold and `make().method()` loses its receiver. Re-read
+ * such a name where the function lives: a class of the function's own module,
+ * else (function of the current file) whatever the name is bound to here.
+ * shortcut: plain names only; Optional[T]/unions keep their registered form,
+ * and a cross-file function returning a class it imported stays unresolved. */
+static const CBMType *py_canonical_return_named(PyLSPContext *ctx, const char *func_qn,
+                                                const CBMType *base) {
+    if (!base || base->kind != CBM_TYPE_NAMED || !base->data.named.qualified_name)
+        return base;
+    const char *qn = base->data.named.qualified_name;
+    if (cbm_registry_lookup_type(ctx->registry, qn))
+        return base;
+    const char *tail = strrchr(qn, '.');
+    tail = tail ? tail + 1 : qn;
+    size_t mod_len = ctx->module_qn ? strlen(ctx->module_qn) : 0;
+    bool own_file =
+        mod_len > 0 && strncmp(func_qn, ctx->module_qn, mod_len) == 0 && func_qn[mod_len] == '.';
+    if (tail != qn && !own_file)
+        return base; /* a dotted name of another file: not ours to re-read */
+    /* Enclosing scopes of the function, innermost first: Class.method -> module. */
+    char *prefix = cbm_arena_strdup(ctx->arena, func_qn);
+    for (char *dot = prefix ? strrchr(prefix, '.') : NULL; dot; dot = strrchr(prefix, '.')) {
+        *dot = '\0';
+        const char *cand = cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, tail);
+        if (cand && cbm_registry_lookup_type(ctx->registry, cand))
+            return cbm_type_named(ctx->arena, cand);
+    }
+    if (own_file) {
+        const CBMType *bound = py_resolve_annotation(ctx, tail);
+        if (bound && bound->kind == CBM_TYPE_NAMED && bound->data.named.qualified_name &&
+            cbm_registry_lookup_type(ctx->registry, bound->data.named.qualified_name))
+            return bound;
+    }
+    return base;
+}
+
 /* If `func_qn` is a registered function, return its return type. When
  * called on a receiver, pass receiver_qn to substitute Self return
  * types; pass NULL otherwise. */
@@ -1990,6 +2030,7 @@ static const CBMType *py_func_return_type_recv(PyLSPContext *ctx, const char *fu
             count++;
         base = cbm_type_tuple(ctx->arena, rets, count);
     }
+    base = py_canonical_return_named(ctx, func_qn, base);
     if (receiver_qn) {
         return py_substitute_self(ctx, base, receiver_qn);
     }
@@ -2589,8 +2630,25 @@ static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node)
         return lt ? lt : cbm_type_unknown();
     }
 
-    if (strcmp(k, "comparison_operator") == 0 || strcmp(k, "boolean_operator") == 0 ||
-        strcmp(k, "not_operator") == 0) {
+    if (strcmp(k, "comparison_operator") == 0 || strcmp(k, "not_operator") == 0) {
+        return cbm_type_builtin(ctx->arena, "bool");
+    }
+
+    /* `a or b` / `a and b` evaluate to one of their operands, never to a
+     * bool: `cb = cb or Handler()` keeps the Handler type. Only when both
+     * operands are the same class is the result that class; anything else
+     * keeps the previous answer. */
+    if (strcmp(k, "boolean_operator") == 0) {
+        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        TSNode right = ts_node_child_by_field_name(node, "right", 5);
+        if (!ts_node_is_null(left) && !ts_node_is_null(right)) {
+            const CBMType *lt = py_eval_expr_type(ctx, left);
+            const CBMType *rt = py_eval_expr_type(ctx, right);
+            if (lt && rt && lt->kind == CBM_TYPE_NAMED && rt->kind == CBM_TYPE_NAMED &&
+                lt->data.named.qualified_name && rt->data.named.qualified_name &&
+                strcmp(lt->data.named.qualified_name, rt->data.named.qualified_name) == 0)
+                return lt;
+        }
         return cbm_type_builtin(ctx->arena, "bool");
     }
 

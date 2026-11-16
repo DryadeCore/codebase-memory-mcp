@@ -91,6 +91,12 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
                                 const char *rel_path, CBMLanguage lang, const CBMFileResult *result,
                                 bool include_type_only, const char ***out_keys,
                                 const char ***out_vals, int *out_count);
+
+/* The Function/Class a def's own import binds for a bare call inside that def
+ * (Python), or NULL. See the definition. */
+const cbm_gbuf_node_t *cbm_pxc_def_import_callee(const cbm_gbuf_t *gbuf, const char *project_name,
+                                                 const char *rel_path, CBMLanguage lang,
+                                                 const CBMFileResult *result, const CBMCall *call);
 /* True when the file records an annotation-only import (the LSP map then
  * differs from the CALLS map and must be built separately). */
 bool cbm_pxc_result_has_type_only_import(const CBMFileResult *result);

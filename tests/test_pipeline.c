@@ -21901,12 +21901,14 @@ static int count_lsp_calls(cbm_store_t *s, const char *project, const char *call
     return count_calls_with(s, project, caller_suffix, callee_suffix, "lsp");
 }
 
-/* As count_lsp_calls, with any properties fragment (NULL = every CALLS edge). */
-static int count_calls_with(cbm_store_t *s, const char *project, const char *caller_suffix,
-                            const char *callee_suffix, const char *fragment) {
+/* Edges of `type` from a node whose QN ends in caller_suffix to one whose QN
+ * ends in callee_suffix, with any properties fragment (NULL = every edge). */
+static int count_edges_with(cbm_store_t *s, const char *project, const char *type,
+                            const char *caller_suffix, const char *callee_suffix,
+                            const char *fragment) {
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
-    cbm_store_find_edges_by_type(s, project, "CALLS", &edges, &edge_count);
+    cbm_store_find_edges_by_type(s, project, type, &edges, &edge_count);
     int hits = 0;
     for (int i = 0; i < edge_count; i++) {
         cbm_node_t src = {0};
@@ -21930,6 +21932,12 @@ static int count_calls_with(cbm_store_t *s, const char *project, const char *cal
     if (edges)
         cbm_store_free_edges(edges, edge_count);
     return hits;
+}
+
+/* As count_lsp_calls, with any properties fragment (NULL = every CALLS edge). */
+static int count_calls_with(cbm_store_t *s, const char *project, const char *caller_suffix,
+                            const char *callee_suffix, const char *fragment) {
+    return count_edges_with(s, project, "CALLS", caller_suffix, callee_suffix, fragment);
 }
 
 static int check_python_crossfile_typed_field_calls_issue1277(bool parallel) {
@@ -22719,6 +22727,242 @@ static int check_python_dotted_base_inheritance(bool parallel) {
     ASSERT_EQ(plain_self, 1);   /* control: from-imported base */
     ASSERT_EQ(untyped, 0);      /* control: no receiver type, no LSP edge */
     PASS();
+}
+
+/* A package one directory below the repository root: `svc/` is the directory
+ * on sys.path, so files under it write `from core.api import replay`. The
+ * import names svc/core/api/replay.py. Resolved against the repository root
+ * alone it named nothing: a def-local import bound no module and the member
+ * call lost its edge, a module-level one kept only a short-name guess. */
+static int check_python_import_source_root_above_importer(bool parallel) {
+    static const char *const files[][2] = {
+        {"svc/core/__init__.py", ""},
+        {"svc/core/api/__init__.py", ""},
+        {"svc/core/api/replay.py", "def verify(session_id):\n"
+                                   "    return {}\n\n"
+                                   "def load(session_id):\n"
+                                   "    return 1\n"},
+        {"svc/other/__init__.py", ""},
+        {"svc/other/replay.py", "def verify(session_id):\n"
+                                "    return None\n"},
+        {"svc/tests/test_local.py", "def test_in_def(store):\n"
+                                    "    from core.api import replay\n\n"
+                                    "    return replay.verify(store)\n"},
+        {"svc/tests/test_top.py", "from core.api import replay\n"
+                                  "from core.api.replay import load\n"
+                                  "import core.api.replay as rp\n\n"
+                                  "def test_at_top(store):\n"
+                                  "    load(store)\n"
+                                  "    rp.load(store)\n"
+                                  "    return replay.verify(store)\n"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 7, parallel);
+    int local = -1, top = -1, direct = -1, aliased = -1, wrong = -1;
+    if (r.s) {
+        const char *project = cbm_pipeline_project_name(r.p);
+        local = count_lsp_calls(r.s, project, "test_local.test_in_def", "core.api.replay.verify");
+        top = count_lsp_calls(r.s, project, "test_top.test_at_top", "core.api.replay.verify");
+        direct = count_lsp_calls(r.s, project, "test_top.test_at_top", "core.api.replay.load");
+        aliased = count_calls_with(r.s, project, "test_top.test_at_top", "core.api.replay.load",
+                                   "lsp_module_attr");
+        wrong = count_calls_with(r.s, project, "test_in_def", "other.replay.verify", NULL) +
+                count_calls_with(r.s, project, "test_at_top", "other.replay.verify", NULL);
+    }
+    bool opened = r.s != NULL;
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_TRUE(opened);
+    ASSERT_EQ(local, 1);   /* def-local import of a submodule, member call */
+    ASSERT_EQ(top, 1);     /* the same at module level, typed, not a name guess */
+    ASSERT_EQ(direct, 1);  /* `from core.api.replay import load` */
+    ASSERT_TRUE(aliased >= 0);
+    ASSERT_EQ(wrong, 0);   /* the homonym module under another package gets nothing */
+    PASS();
+}
+
+TEST(python_import_source_root_above_importer) {
+    return check_python_import_source_root_above_importer(false);
+}
+
+TEST(python_import_source_root_above_importer_parallel) {
+    return check_python_import_source_root_above_importer(true);
+}
+
+/* A def imports a decorated function and calls it, while the project holds
+ * other callables of the same name. The Python LSP declines a decorated
+ * function (no exact callable value) and the def's import is in no file-wide
+ * import map, so the call had only the unique-name guess left and lost its
+ * edge to the second `list_items`. The def's own import statement names the
+ * target. */
+static int check_python_def_import_decorated_callee_with_homonym(bool parallel) {
+    static const char *const files[][2] = {
+        {"pkg/__init__.py", ""},
+        {"pkg/routes.py", "def route(path):\n"
+                          "    def wrap(func):\n"
+                          "        return func\n"
+                          "    return wrap\n\n"
+                          "@route(\"/items\")\n"
+                          "async def list_items(owner=None):\n"
+                          "    return []\n"},
+        {"pkg/service.py", "class ItemService:\n"
+                           "    def list_items(self, owner=None):\n"
+                           "        return []\n\n"
+                           "def list_items(owner=None):\n"
+                           "    return ()\n"},
+        {"pkg/test_routes.py", "from unittest.mock import patch\n\n"
+                               "class TestList:\n"
+                               "    async def test_empty(self):\n"
+                               "        from pkg.routes import list_items\n\n"
+                               "        with patch(\"pkg.routes.get_service\") as svc:\n"
+                               "            svc.return_value.list_items.return_value = []\n"
+                               "            result = await list_items(owner=None)\n"
+                               "        return result\n\n"
+                               "    async def test_no_import(self, list_items):\n"
+                               "        return await list_items(owner=None)\n"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 4, parallel);
+    int bound = -1, homonym = -1, param = -1;
+    if (r.s) {
+        const char *project = cbm_pipeline_project_name(r.p);
+        bound = count_calls_with(r.s, project, "TestList.test_empty", "pkg.routes.list_items",
+                                 "import_map");
+        homonym = count_calls_with(r.s, project, "TestList.test_empty", "service.list_items", NULL) +
+                  count_calls_with(r.s, project, "TestList.test_empty",
+                                   "ItemService.list_items", NULL);
+        param = count_calls_with(r.s, project, "TestList.test_no_import", "list_items", NULL);
+    }
+    bool opened = r.s != NULL;
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_TRUE(opened);
+    ASSERT_EQ(bound, 1);   /* the def's import names pkg.routes.list_items */
+    ASSERT_EQ(homonym, 0); /* neither same-named callable is guessed */
+    ASSERT_EQ(param, 0);   /* a sibling def without the import binds nothing */
+    PASS();
+}
+
+TEST(python_def_import_decorated_callee_with_homonym) {
+    return check_python_def_import_decorated_callee_with_homonym(false);
+}
+
+TEST(python_def_import_decorated_callee_with_homonym_parallel) {
+    return check_python_def_import_decorated_callee_with_homonym(true);
+}
+
+/* A return annotation naming a class types the call's result, wherever the
+ * class comes from: a helper of this file returning an imported class
+ * (`def _make() -> Store`), an imported function returning a class of its own
+ * module, and the same function reached as a module attribute. The annotation
+ * was registered as `<this module>.Store` (own file) or bare `Store`
+ * (cross-file), neither a known type, so the receiver of `x.method()` was
+ * lost. The same-named method of another class is never the target. */
+static int check_python_return_annotation_types_receiver(bool parallel) {
+    static const char *const files[][2] = {
+        {"pkg/__init__.py", ""},
+        {"pkg/history.py", "class Store:\n"
+                           "    def get_rate(self, name: str) -> dict:\n"
+                           "        return {}\n\n"
+                           "    def end(self, name: str) -> None:\n"
+                           "        return None\n\n"
+                           "class Other:\n"
+                           "    def get_rate(self, name: str) -> dict:\n"
+                           "        return {}\n\n"
+                           "def make_remote() -> Store:\n"
+                           "    return Store()\n\n"
+                           "def make_untyped():\n"
+                           "    return Store()\n"},
+        {"pkg/use.py", "from pkg.history import Store, make_remote, make_untyped\n\n"
+                       "def _make_store() -> Store:\n"
+                       "    return Store()\n\n"
+                       "def own_helper():\n"
+                       "    store = _make_store()\n"
+                       "    return store.get_rate(\"a\")\n\n"
+                       "def imported_function():\n"
+                       "    store = make_remote()\n"
+                       "    return store.get_rate(\"b\")\n\n"
+                       "def untyped():\n"
+                       "    store = make_untyped()\n"
+                       "    return store.get_rate(\"c\")\n"},
+        {"tests/test_mod.py", "import pkg.history as history\n\n"
+                              "def test_attr():\n"
+                              "    store = history.make_remote()\n"
+                              "    assert store.get_rate(\"d\")\n"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 4, parallel);
+    int own = -1, imported = -1, attr = -1, other = -1;
+    if (r.s) {
+        const char *project = cbm_pipeline_project_name(r.p);
+        own = count_lsp_calls(r.s, project, "use.own_helper", "history.Store.get_rate");
+        imported = count_lsp_calls(r.s, project, "use.imported_function", "history.Store.get_rate");
+        attr = count_lsp_calls(r.s, project, "test_mod.test_attr", "history.Store.get_rate");
+        other = count_calls_with(r.s, project, "", "history.Other.get_rate", NULL);
+    }
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_EQ(own, 1);
+    ASSERT_EQ(imported, 1);
+    ASSERT_EQ(attr, 1);
+    ASSERT_EQ(other, 0);   /* the homonym method is never a target */
+    PASS();
+}
+
+TEST(python_return_annotation_types_receiver) {
+    return check_python_return_annotation_types_receiver(false);
+}
+
+TEST(python_return_annotation_types_receiver_parallel) {
+    return check_python_return_annotation_types_receiver(true);
+}
+
+/* `cb = cb or Handler()` evaluates to one of its operands. Both are Handler
+ * here (the parameter is annotated), so the closure below calls
+ * Handler.on_done. The expression was typed bool, which has no such method.
+ * Operands of different classes stay unresolved. */
+static int check_python_or_default_keeps_operand_class(bool parallel) {
+    static const char *const files[][2] = {
+        {"hooks.py", "class Handler:\n"
+                     "    def on_done(self, run_id: str) -> None:\n"
+                     "        return None\n\n"
+                     "class Fallback:\n"
+                     "    def on_done(self, run_id: str) -> None:\n"
+                     "        return None\n\n"
+                     "def register(callback: Handler = None):\n"
+                     "    callback = callback or Handler()\n\n"
+                     "    def handle(source, event):\n"
+                     "        callback.on_done(str(event))\n\n"
+                     "    return handle\n\n"
+                     "def mixed(callback: Handler = None):\n"
+                     "    chosen = callback or Fallback()\n"
+                     "    chosen.on_done(\"x\")\n"},
+    };
+    py_def_import_run_t r;
+    py_def_import_open(&r, files, 1, parallel);
+    int closure = -1, mixed = -1;
+    if (r.s) {
+        const char *project = cbm_pipeline_project_name(r.p);
+        closure = count_lsp_calls(r.s, project, "register.handle", "Handler.on_done");
+        mixed = count_calls_with(r.s, project, ".mixed", ".on_done", NULL);
+    }
+    int unpin_rc = py_def_import_close(&r, parallel);
+    ASSERT_EQ(unpin_rc, 0);
+    ASSERT_EQ(r.run_rc, 0);
+    ASSERT_EQ(closure, 1);
+    ASSERT_EQ(mixed, 0);
+    PASS();
+}
+
+TEST(python_or_default_keeps_operand_class) {
+    return check_python_or_default_keeps_operand_class(false);
+}
+
+TEST(python_or_default_keeps_operand_class_parallel) {
+    return check_python_or_default_keeps_operand_class(true);
 }
 
 TEST(python_dotted_base_inheritance) {
@@ -35851,6 +36095,14 @@ SUITE(pipeline) {
     RUN_TEST(python_def_dotted_import_issue2285);
     RUN_TEST(python_def_dotted_import_issue2285_parallel);
     RUN_TEST(python_def_import_nested_base_driver_parity_issue2285);
+    RUN_TEST(python_import_source_root_above_importer);
+    RUN_TEST(python_import_source_root_above_importer_parallel);
+    RUN_TEST(python_def_import_decorated_callee_with_homonym);
+    RUN_TEST(python_def_import_decorated_callee_with_homonym_parallel);
+    RUN_TEST(python_return_annotation_types_receiver);
+    RUN_TEST(python_return_annotation_types_receiver_parallel);
+    RUN_TEST(python_or_default_keeps_operand_class);
+    RUN_TEST(python_or_default_keeps_operand_class_parallel);
     RUN_TEST(python_dotted_base_inheritance);
     RUN_TEST(python_dotted_base_inheritance_parallel);
     RUN_TEST(pipeline_python_package_reexports_resolve_by_lsp);

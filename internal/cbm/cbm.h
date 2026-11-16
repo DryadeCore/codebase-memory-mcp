@@ -453,6 +453,8 @@ typedef struct {
                              // binds the name for annotations, never at runtime (#1277)
     bool function_scope;     // Python: inside a def body -- binds the name in that
                              // function's scope only, never in the module's (#2285)
+    uint32_t scope_start_byte; // function_scope only: byte range of the outermost def
+    uint32_t scope_end_byte;   // whose body holds the import; 0/0 otherwise
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
 

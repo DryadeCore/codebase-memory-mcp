@@ -3044,6 +3044,67 @@ static const cbm_gbuf_node_t *rust_use_resolve(const cbm_pipeline_ctx_t *ctx,
  * winner is selected, so a non-PHP collision cannot hide a later PHP hit.
  * src_lang is the importing file's language; it gates the name-guess
  * fallbacks (#1934). */
+/* Python source root above the importing file. `from core.api import routes`
+ * written in `svc/tests/test_x.py` names `svc/core/api/routes.py` when `svc/`
+ * is the directory on sys.path (a src/ layout, a package checked out one level
+ * down). Strategy 1 resolves against the repository root only, so it misses
+ * the module and the import either guesses by short name or binds nothing.
+ * Try each ancestor directory of the importing file as the root, nearest
+ * first. The whole dotted path must exist under that root: either as a
+ * module, or as a member (or submodule) of the module its parent path names.
+ * shortcut: an importer outside the source root (a script next to it) is not
+ * covered, upgrade to a project-wide unique module-suffix index if needed. */
+static const cbm_gbuf_node_t *python_ancestor_root_import(const cbm_pipeline_ctx_t *ctx,
+                                                          const char *source_rel,
+                                                          const char *source_file_qn,
+                                                          const char *module_path) {
+    if (!source_rel || !module_path || module_path[0] == '.' || strchr(module_path, ' ') ||
+        strchr(module_path, '*')) {
+        return NULL;
+    }
+    char dir[PKGMAP_PATH_BUF];
+    snprintf(dir, sizeof(dir), "%s", source_rel);
+    for (char *slash = strrchr(dir, '/'); slash; slash = strrchr(dir, '/')) {
+        *slash = '\0';
+        char path[PKGMAP_PATH_BUF];
+        int len = snprintf(path, sizeof(path), "%s/%s", dir, module_path);
+        if (len < 0 || (size_t)len >= sizeof(path)) {
+            return NULL;
+        }
+        for (char *c = path + strlen(dir) + 1; *c; c++) {
+            if (*c == '.') {
+                *c = '/';
+            }
+        }
+        char *qn = cbm_pipeline_fqn_module(ctx->project_name, path);
+        const cbm_gbuf_node_t *node = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+        free(qn);
+        if (node && node->label &&
+            (strcmp(node->label, "Module") == 0 || strcmp(node->label, "File") == 0 ||
+             strcmp(node->label, "Folder") == 0) &&
+            (!source_file_qn || strcmp(node->qualified_name, source_file_qn) != 0)) {
+            return node;
+        }
+        char *leaf = strrchr(path + strlen(dir) + 1, '/');
+        if (!leaf) {
+            continue;
+        }
+        *leaf++ = '\0';
+        qn = cbm_pipeline_fqn_module(ctx->project_name, path);
+        const cbm_gbuf_node_t *owner = qn ? cbm_gbuf_find_by_qn(ctx->gbuf, qn) : NULL;
+        free(qn);
+        if (!owner || !owner->label ||
+            (strcmp(owner->label, "Module") != 0 && strcmp(owner->label, "File") != 0)) {
+            continue;
+        }
+        char member_qn[PKGMAP_PATH_BUF];
+        snprintf(member_qn, sizeof(member_qn), "%s.%s", owner->qualified_name, leaf);
+        const cbm_gbuf_node_t *member = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
+        return member && import_targetable_label(member->label) ? member : owner;
+    }
+    return NULL;
+}
+
 static const cbm_gbuf_node_t *resolve_import_strategies(
     const cbm_pipeline_ctx_t *ctx, const char *source_rel, const char *source_file_qn,
     const CBMImport *imp, CBMHashTable *namespace_map, CBMLanguage src_lang, bool php_only) {
@@ -3084,6 +3145,14 @@ static const cbm_gbuf_node_t *resolve_import_strategies(
             }
         }
         return target;
+    }
+
+    if (src_lang == CBM_LANG_PYTHON && !php_only) {
+        const cbm_gbuf_node_t *rooted =
+            python_ancestor_root_import(ctx, source_rel, source_file_qn, imp->module_path);
+        if (rooted) {
+            return rooted;
+        }
     }
 
     /* Rust: a `use` path names an item of one crate, never a same-named

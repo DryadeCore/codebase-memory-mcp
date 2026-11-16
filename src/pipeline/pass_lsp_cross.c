@@ -1620,6 +1620,64 @@ int cbm_pxc_build_import_map_ex(const cbm_gbuf_t *gbuf, const char *project_name
     return 0;
 }
 
+/* The callable a def's own import binds for a bare call inside that def:
+ * `def test(): from pkg.routes import handler; handler()`. Such an import is
+ * in no file-wide import map (it binds a local of the def, #2285), so when the
+ * Python LSP declines the call (a decorated function has no exact callable
+ * value) only a project-wide short-name guess was left, and that binds
+ * nothing once two definitions share the name. The def's import statement
+ * names the target itself: read it from the IMPORTS edge that statement
+ * produced. NULL unless exactly the def enclosing the call site imports the
+ * name and the edge lands on a Function or Class of that name. */
+const cbm_gbuf_node_t *cbm_pxc_def_import_callee(const cbm_gbuf_t *gbuf, const char *project_name,
+                                                 const char *rel_path, CBMLanguage lang,
+                                                 const CBMFileResult *result, const CBMCall *call) {
+    if (lang != CBM_LANG_PYTHON || !gbuf || !result || !call || !call->callee_name ||
+        call->site_end_byte == 0 || strchr(call->callee_name, '.')) {
+        return NULL;
+    }
+    bool bound = false;
+    for (int i = 0; i < result->imports.count && !bound; i++) {
+        const CBMImport *imp = &result->imports.items[i];
+        bound = imp->function_scope && imp->local_name &&
+                strcmp(imp->local_name, call->callee_name) == 0 &&
+                imp->scope_start_byte <= call->site_start_byte &&
+                call->site_start_byte < imp->scope_end_byte;
+    }
+    if (!bound) {
+        return NULL;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
+    const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(gbuf, file_qn) : NULL;
+    free(file_qn);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (!file_node || cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
+                                                         &edge_count) != 0) {
+        return NULL;
+    }
+    char want[CBM_SZ_256];
+    int want_len = snprintf(want, sizeof(want), "\"local_name\":\"%s\"", call->callee_name);
+    if (want_len < 0 || (size_t)want_len >= sizeof(want)) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *found = NULL;
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
+        if (!target || !target->label || !target->name || !edges[i]->properties_json ||
+            !strstr(edges[i]->properties_json, want) ||
+            strcmp(target->name, call->callee_name) != 0 ||
+            (strcmp(target->label, "Function") != 0 && strcmp(target->label, "Class") != 0)) {
+            continue;
+        }
+        if (found && found != target) {
+            return NULL; /* two defs import the name from different modules */
+        }
+        found = target;
+    }
+    return found;
+}
+
 void cbm_pxc_free_import_map(const char **keys, const char **vals, int count) {
     if (keys) {
         for (int i = 0; i < count; i++)

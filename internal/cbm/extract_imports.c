@@ -484,7 +484,12 @@ static void py_record_function_imports(CBMExtractCtx *ctx) {
         if (is_def) {
             TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
             if (!ts_node_is_null(body)) {
+                int first = imports->count;
                 (void)py_record_subtree_imports(ctx, body);
+                for (int i = first; i < imports->count; i++) {
+                    imports->items[i].scope_start_byte = ts_node_start_byte(node);
+                    imports->items[i].scope_end_byte = ts_node_end_byte(node);
+                }
             }
         }
         if (!is_def && ts_tree_cursor_goto_first_child(&cursor)) {
